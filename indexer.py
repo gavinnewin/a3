@@ -65,58 +65,70 @@ def extract_visible_text(html_content: str) -> str:
     return soup.get_text(separator=" ", strip=True)
 
 
-# -------------------- IMPORTANT WORD WEIGHTING + BIGRAMS --------------------
+# -------------------- IMPORTANT WORD WEIGHTING + POSITIONS + BIGRAMS --------------------
 
-def extract_weighted_term_counts(html_content: str) -> collections.Counter:
+def extract_term_info(html_content: str):
     """
-    Give extra weight to:
-      - title: 3x
-      - h1,h2,h3: 2x
-      - bold/strong: 2x
-      - body text: 1x
-    Also builds 2-gram tokens from the full visible text, stored as "w1_w2".
+    Returns:
+      - term_tf: dict term -> weighted tf (for scoring)
+      - term_positions: dict term -> list of positions (unweighted)
+    Also adds bigram terms (t1_t2) with positions.
     """
+    # First get visible text and tokens for positions
+    visible_text = extract_visible_text(html_content)
+    tokens = tokenize_text(visible_text)
+    stemmed_tokens = [stem_token(t) for t in tokens]
+
+    term_positions = {}
+    for idx, tok in enumerate(stemmed_tokens):
+        if not tok:
+            continue
+        term_positions.setdefault(tok, []).append(idx)
+
+    # base tf is count of positions
+    term_tf = {term: len(pos_list) for term, pos_list in term_positions.items()}
+
+    # Field weighting: parse HTML with BeautifulSoup to detect title/headings/bold
     try:
         soup = BeautifulSoup(html_content or "", "lxml")
     except Exception:
         soup = BeautifulSoup(html_content or "", "html.parser")
 
-    term_counts: collections.Counter = collections.Counter()
+    extra_weight = collections.Counter()
 
-    def add_text(text: str, weight: int):
+    def add_weight_from_text(text, weight):
         for tok in tokenize_text(text):
             stem = stem_token(tok)
             if stem:
-                term_counts[stem] += weight
+                extra_weight[stem] += weight
 
     # title
     if soup.title and soup.title.string:
-        add_text(soup.title.get_text(separator=" ", strip=True), weight=3)
+        add_weight_from_text(soup.title.get_text(separator=" ", strip=True), weight=3)
 
     # headings
     for h in soup.find_all(["h1", "h2", "h3"]):
-        add_text(h.get_text(separator=" ", strip=True), weight=2)
+        add_weight_from_text(h.get_text(separator=" ", strip=True), weight=2)
 
     # bold / strong
     for b in soup.find_all(["b", "strong"]):
-        add_text(b.get_text(separator=" ", strip=True), weight=2)
+        add_weight_from_text(b.get_text(separator=" ", strip=True), weight=2)
 
-    # full body text unweighted
-    body_text = soup.get_text(separator=" ", strip=True)
-    add_text(body_text, weight=1)
+    # apply extra weights to term_tf
+    for term, w in extra_weight.items():
+        term_tf[term] = term_tf.get(term, 0) + w
 
-    # 2-gram (bigram) tokens from body text
-    body_tokens = tokenize_text(body_text)
-    stemmed_tokens = [stem_token(t) for t in body_tokens]
+    # bigram terms + positions (from stemmed tokens)
     for i in range(len(stemmed_tokens) - 1):
         t1 = stemmed_tokens[i]
         t2 = stemmed_tokens[i + 1]
         if not t1 or not t2:
             continue
         bigram_term = f"{t1}_{t2}"
-        term_counts[bigram_term] += 1  # phrase-level signal
+        term_positions.setdefault(bigram_term, []).append(i)  # position = start index
+        term_tf[bigram_term] = term_tf.get(bigram_term, 0) + 1
 
-    return term_counts
+    return term_tf, term_positions
 
 
 # -------------------- PARTIAL INDEX WRITING / MERGE --------------------
@@ -125,7 +137,10 @@ def write_partial_index(part_number, inverted_index, output_folder: Path) -> Pat
     part_path = output_folder / f"partial_{part_number:03d}.jsonl"
     with part_path.open("w", encoding="utf-8") as f:
         for term in sorted(inverted_index.keys()):
-            postings = sorted(inverted_index[term].items())
+            postings = []
+            for doc_id, (tf, pos_list) in inverted_index[term].items():
+                postings.append([doc_id, tf, pos_list])
+            postings.sort(key=lambda x: x[0])
             f.write(json.dumps({"term": term, "postings": postings}) + "\n")
     return part_path
 
@@ -142,16 +157,19 @@ def merge_partial_indexes(part_paths, final_path: Path):
 
         with final_path.open("w", encoding="utf-8") as out:
             while cursors:
-                # smallest term across all partials
                 cursors.sort(key=lambda x: x[0])
-                smallest_term = cursors[0][0]
+                current_term = cursors[0][0]
                 combined = {}
                 refill = []
 
-                while cursors and cursors[0][0] == smallest_term:
+                while cursors and cursors[0][0] == current_term:
                     _, entry, file_index = cursors.pop(0)
-                    for doc_id, tf in entry["postings"]:
-                        combined[doc_id] = combined.get(doc_id, 0) + tf
+                    for doc_id, tf, pos_list in entry["postings"]:
+                        if doc_id not in combined:
+                            combined[doc_id] = [tf, list(pos_list)]
+                        else:
+                            combined[doc_id][0] += tf
+                            combined[doc_id][1].extend(pos_list)
 
                     nxt = files[file_index].readline()
                     if nxt:
@@ -159,28 +177,27 @@ def merge_partial_indexes(part_paths, final_path: Path):
                         refill.append((nxt_obj["term"], nxt_obj, file_index))
 
                 cursors.extend(refill)
-                sorted_postings = sorted(combined.items())
-                out.write(
-                    json.dumps({"term": smallest_term, "postings": sorted_postings})
-                    + "\n"
-                )
+                postings = []
+                for doc_id, (tf, pos_list) in combined.items():
+                    postings.append([doc_id, tf, pos_list])
+                postings.sort(key=lambda x: x[0])
+                out.write(json.dumps({"term": current_term, "postings": postings}) + "\n")
     finally:
         for fh in files:
             fh.close()
 
 
-# -------------------- MAIN INDEX BUILD (WITH DUPLICATE REMOVAL) --------------------
+# -------------------- MAIN INDEX BUILD (WITH DUPLICATES + POSITIONS) --------------------
 
 def build_external_index(data_folder: Path, output_folder: Path, memory_limit_mb: int):
     memory_limit_bytes = memory_limit_mb * 1024 * 1024
     json_files = collect_json_files(data_folder)
 
-    inverted_index = collections.defaultdict(lambda: collections.defaultdict(int))
+    inverted_index = collections.defaultdict(lambda: collections.defaultdict(tuple))
     document_table = []
     partial_paths = []
     estimated_bytes = 0
 
-    # For exact-duplicate detection
     seen_hashes = {}
     duplicates = []
 
@@ -201,13 +218,14 @@ def build_external_index(data_folder: Path, output_folder: Path, memory_limit_mb
         else:
             seen_hashes[content_hash] = url
 
-        term_counts = extract_weighted_term_counts(html)
-        doc_length = sum(term_counts.values())
+        term_tf, term_positions = extract_term_info(html)
+        doc_length = sum(term_tf.values())
         document_table.append((url, doc_length))
 
-        for term, count in term_counts.items():
-            inverted_index[term][current_doc_id] += count
-            estimated_bytes += len(term) + 12
+        for term, tf in term_tf.items():
+            positions = term_positions.get(term, [])
+            inverted_index[term][current_doc_id] = (tf, positions)
+            estimated_bytes += len(term) + 12 + len(positions) * 4
 
         current_doc_id += 1
 
@@ -224,7 +242,6 @@ def build_external_index(data_folder: Path, output_folder: Path, memory_limit_mb
     final_index_path = output_folder / "index_merged.jsonl"
     merge_partial_indexes(partial_paths, final_index_path)
 
-    # write out duplicate report (exact duplicates)
     if duplicates:
         dup_path = output_folder / "duplicates.tsv"
         with dup_path.open("w", encoding="utf-8") as f:
@@ -254,13 +271,13 @@ def compute_analytics(index_file: Path, document_table, output_folder: Path):
 # -------------------- CLI ENTRY POINT --------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="ICS Search Engine Indexer (developer option, with extras)")
+    parser = argparse.ArgumentParser(description="ICS Search Engine Indexer (developer, positions + bigrams)")
     parser.add_argument("--data-folder", type=Path, required=True,
                         help="Root folder with per-domain JSON files")
     parser.add_argument("--output-folder", type=Path, required=True,
                         help="Where to write index_merged.jsonl and doc_table.tsv")
     parser.add_argument("--memory-limit", type=int, default=256,
-                        help="Approximate memory limit (MB) for in-memory index before spilling")
+                        help="Approximate memory limit (MB) before spilling partial index")
     args = parser.parse_args()
 
     output_folder = args.output_folder
@@ -274,7 +291,7 @@ def main():
     compute_analytics(index_file, document_table, output_folder)
     elapsed = time.perf_counter() - start_time
 
-    print("\n=== Successful Index Build (with exact-duplicate removal + bigrams) ===")
+    print("\n=== Successful Index Build (duplicates removed, positions + bigrams) ===")
     print(f"Indexed documents : {len(document_table)}")
     print(f"Index file        : {index_file}")
     print(f"Output folder     : {output_folder.resolve()}")
