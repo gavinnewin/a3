@@ -1,12 +1,14 @@
 import argparse
 import json
 import re
+import time
 import collections
 from pathlib import Path
-from bs4 import BeautifulSoup
-from collections import Counter
+
+from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 import warnings
 
+# silence noisy XML-as-HTML warnings when parsing weird pages
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
 # -------------------- TOKENIZATION / STEMMING --------------------
@@ -18,6 +20,10 @@ try:
     stemmer = PorterStemmer()
 except Exception:
     stemmer = None
+
+
+def tokenize_text(text):
+    return [m.group(0).lower() for m in token_regex.finditer(text or "")]
 
 
 def stem_token(word):
@@ -33,56 +39,7 @@ def stem_token(word):
     return word
 
 
-def tokenize_text(text):
-    return [m.group(0).lower() for m in token_regex.finditer(text)]
-
-
-# -------------------- IMPORTANT WORD WEIGHTING --------------------
-
-def extract_weighted_term_counts(html_content):
-    """
-    Give extra weight to:
-      - title: 3x
-      - h1,h2,h3: 2x
-      - bold/strong: 2x
-      - body text: 1x
-    """
-    try:
-        soup = BeautifulSoup(html_content or "", "lxml")
-    except Exception:
-        soup = BeautifulSoup(html_content or "", "html.parser")
-
-    # remove scripts/styles/noscript
-    for tag in soup(["script", "style", "noscript"]):
-        tag.extract()
-
-    term_counts = Counter()
-
-    def add_text(text, weight):
-        if not text:
-            return
-        for tok in tokenize_text(text):
-            term_counts[stem_token(tok)] += weight
-
-    # title
-    if soup.title:        add_text(soup.title.get_text(separator=" ", strip=True), weight=3)
-
-    # headings
-    for h in soup.find_all(["h1", "h2", "h3"]):
-        add_text(h.get_text(separator=" ", strip=True), weight=2)
-
-    # bold/strong
-    for b in soup.find_all(["b", "strong"]):
-        add_text(b.get_text(separator=" ", strip=True), weight=2)
-
-    # full body
-    body_text = soup.get_text(separator=" ", strip=True)
-    add_text(body_text, weight=1)
-
-    return term_counts
-
-
-# -------------------- JSON / FILE HELPERS --------------------
+# -------------------- JSON / HTML HELPERS --------------------
 
 def load_json_page(json_path):
     try:
@@ -98,15 +55,51 @@ def collect_json_files(folder):
     return list(folder.rglob("*.json"))
 
 
-# -------------------- PARTIAL INDEX / MERGE --------------------
+# -------------------- IMPORTANT WORD WEIGHTING --------------------
 
-def write_partial_index(part_number, partial_index, output_folder):
-    partial_path = output_folder / f"partial_{part_number:03d}.jsonl"
-    with partial_path.open("w", encoding="utf-8") as file:
-        for term in sorted(partial_index.keys()):
-            postings = sorted(partial_index[term].items())
-            file.write(json.dumps({"term": term, "postings": postings}) + "\n")
-    return partial_path
+def extract_weighted_term_counts(html_content):
+    """Return Counter(term -> weighted_tf) using field weights."""
+    try:
+        soup = BeautifulSoup(html_content or "", "lxml")
+    except Exception:
+        soup = BeautifulSoup(html_content or "", "html.parser")
+
+    term_counts = collections.Counter()
+
+    def add_text(text, weight):
+        for tok in tokenize_text(text):
+            stem = stem_token(tok)
+            if stem:
+                term_counts[stem] += weight
+
+    # title
+    if soup.title and soup.title.string:
+        add_text(soup.title.get_text(separator=" ", strip=True), weight=3)
+
+    # headings
+    for h in soup.find_all(["h1", "h2", "h3"]):
+        add_text(h.get_text(separator=" ", strip=True), weight=2)
+
+    # bold / strong
+    for b in soup.find_all(["b", "strong"]):
+        add_text(b.get_text(separator=" ", strip=True), weight=2)
+
+    # full body text
+    body_text = soup.get_text(separator=" ", strip=True)
+    add_text(body_text, weight=1)
+
+    return term_counts
+
+
+# -------------------- PARTIAL INDEX WRITING / MERGE --------------------
+
+def write_partial_index(part_number, inverted_index, output_folder):
+    part_path = output_folder / f"partial_{part_number:03d}.jsonl"
+    with part_path.open("w", encoding="utf-8") as f:
+        for term in sorted(inverted_index.keys()):
+            postings = sorted(inverted_index[term].items())
+            f.write(json.dumps({"term": term, "postings": postings}) + "\n")
+    return part_path
 
 
 def merge_partial_indexes(part_paths, final_path):
@@ -121,13 +114,13 @@ def merge_partial_indexes(part_paths, final_path):
 
         with final_path.open("w", encoding="utf-8") as out:
             while cursors:
-                # smallest term across all partials
                 cursors.sort(key=lambda x: x[0])
-                smallest_term = cursors[0][0]
+                current_term = cursors[0][0]
+
                 combined = {}
                 refill = []
 
-                while cursors and cursors[0][0] == smallest_term:
+                while cursors and cursors[0][0] == current_term:
                     _, entry, file_index = cursors.pop(0)
                     for doc_id, tf in entry["postings"]:
                         combined[doc_id] = combined.get(doc_id, 0) + tf
@@ -138,16 +131,19 @@ def merge_partial_indexes(part_paths, final_path):
                         refill.append((nxt_obj["term"], nxt_obj, file_index))
 
                 cursors.extend(refill)
-
                 sorted_postings = sorted(combined.items())
-                out.write(json.dumps({"term": smallest_term,
-                                      "postings": sorted_postings}) + "\n")
+                out.write(
+                    json.dumps(
+                        {"term": current_term, "postings": sorted_postings}
+                    )
+                    + "\n"
+                )
     finally:
         for fh in files:
             fh.close()
 
 
-# -------------------- BUILD EXTERNAL INDEX --------------------
+# -------------------- MAIN INDEX BUILD --------------------
 
 def build_external_index(data_folder, output_folder, memory_limit_mb):
     memory_limit_bytes = memory_limit_mb * 1024 * 1024
@@ -161,12 +157,13 @@ def build_external_index(data_folder, output_folder, memory_limit_mb):
     for doc_id, json_file in enumerate(json_files):
         url, html = load_json_page(json_file)
         term_counts = extract_weighted_term_counts(html)
+        doc_length = sum(term_counts.values())
+
+        document_table.append((url, doc_length))
 
         for term, count in term_counts.items():
             inverted_index[term][doc_id] += count
             estimated_bytes += len(term) + 12
-
-        document_table.append((url, sum(term_counts.values())))
 
         if estimated_bytes >= memory_limit_bytes:
             part_path = write_partial_index(len(partial_paths), inverted_index, output_folder)
@@ -178,48 +175,58 @@ def build_external_index(data_folder, output_folder, memory_limit_mb):
         part_path = write_partial_index(len(partial_paths), inverted_index, output_folder)
         partial_paths.append(part_path)
 
-    final_path = output_folder / "index_merged.jsonl"
-    merge_partial_indexes(partial_paths, final_path)
+    final_index_path = output_folder / "index_merged.jsonl"
+    merge_partial_indexes(partial_paths, final_index_path)
 
-    return final_path, document_table
+    return final_index_path, document_table
 
 
-# -------------------- DOC TABLE + ANALYTICS --------------------
+# -------------------- OUTPUT ARTIFACTS --------------------
 
 def save_doc_table(document_table, output_folder):
-    with (output_folder / "doc_table.tsv").open("w", encoding="utf-8") as f:
+    doc_table_path = output_folder / "doc_table.tsv"
+    with doc_table_path.open("w", encoding="utf-8") as f:
         for doc_id, (url, length) in enumerate(document_table):
             f.write(f"{doc_id}\t{url}\t{length}\n")
 
 
 def compute_analytics(index_file, document_table, output_folder):
-    unique_terms = sum(1 for _ in open(index_file, encoding="utf-8"))
+    unique_terms = sum(1 for _ in index_file.open("r", encoding="utf-8"))
     index_kb = index_file.stat().st_size // 1024
-    with (output_folder / "analytics.csv").open("w", encoding="utf-8") as f:
+    analytics_path = output_folder / "analytics.csv"
+    with analytics_path.open("w", encoding="utf-8") as f:
         f.write("doc_count,unique_terms,index_size_kb\n")
         f.write(f"{len(document_table)},{unique_terms},{index_kb}\n")
 
 
-# -------------------- MAIN: BUILD INDEX --------------------
+# -------------------- CLI ENTRY POINT --------------------
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data-folder", type=Path, required=True)
-    parser.add_argument("--output-folder", type=Path, required=True)
-    parser.add_argument("--memory-limit", type=int, default=256)
+    parser = argparse.ArgumentParser(description="ICS Search Engine Indexer (developer option)")
+    parser.add_argument("--data-folder", type=Path, required=True,
+                        help="Root folder with per-domain JSON files")
+    parser.add_argument("--output-folder", type=Path, required=True,
+                        help="Where to write index_merged.jsonl and doc_table.tsv")
+    parser.add_argument("--memory-limit", type=int, default=256,
+                        help="Approximate memory limit (MB) for in-memory index before spilling")
     args = parser.parse_args()
 
     output_folder = args.output_folder
     output_folder.mkdir(parents=True, exist_ok=True)
 
+    start_time = time.perf_counter()
     index_file, document_table = build_external_index(
         args.data_folder, output_folder, args.memory_limit
     )
-
     save_doc_table(document_table, output_folder)
     compute_analytics(index_file, document_table, output_folder)
+    elapsed = time.perf_counter() - start_time
 
     print("\n=== Successful Index Build ===")
+    print(f"Indexed documents : {len(document_table)}")
+    print(f"Index file        : {index_file}")
+    print(f"Output folder     : {output_folder.resolve()}")
+    print(f"Elapsed time      : {elapsed:.2f} seconds")
 
 
 if __name__ == "__main__":
